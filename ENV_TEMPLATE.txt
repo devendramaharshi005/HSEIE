@@ -1,0 +1,44 @@
+# ============================================
+# High-Scale Energy Ingestion Engine
+# Environment Configuration Template
+# ============================================
+#
+# INSTRUCTIONS:
+# 1. Create a new file named ".env" in the project root
+# 2. Copy the content below into that file
+# 3. Update the values as needed
+#
+# ============================================
+
+NODE_ENV=development
+PORT=3000
+
+# PostgreSQL Database
+DB_HOST=localhost
+DB_PORT=5432
+DB_USERNAME=postgres
+DB_PASSWORD=postgres
+DB_DATABASE=energy_ingestion
+
+# Redis Configuration
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+# Feature Flags
+USE_QUEUE=true    # Enable Redis queue for async batch processing (high throughput)
+USE_CACHE=true    # Enable Redis cache for analytics (reduced DB load)
+
+# ============================================
+# CONFIGURATION NOTES:
+# ============================================
+#
+# For Docker deployment (using docker-compose):
+# - DB_HOST=localhost (if running API outside Docker)
+# - DB_HOST=postgres (if running API inside Docker container)
+#
+# For local PostgreSQL:
+# - DB_HOST=localhost
+# - Update DB_USERNAME and DB_PASSWORD with your PostgreSQL credentials
+#
+# ============================================
+
