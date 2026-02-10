@@ -28,12 +28,12 @@ export class AnalyticsCachedService {
     if (this.USE_CACHE) {
       const cacheKey = `performance:${vehicleId}`;
       const cached = await this.cacheManager.get<PerformanceResponseDto>(cacheKey);
-      
+
       if (cached) {
         this.logger.debug(`✓ Cache HIT for ${vehicleId}`);
         return { ...cached, cached: true } as any;
       }
-      
+
       this.logger.debug(`✗ Cache MISS for ${vehicleId} - querying database`);
     }
 
@@ -56,10 +56,13 @@ export class AnalyticsCachedService {
       [vehicleId, last24Hours],
     );
 
-    if (!result || result.length === 0 || !result[0].reading_count || result[0].reading_count === '0') {
-      throw new NotFoundException(
-        `No data found for vehicle ${vehicleId} in the last 24 hours`,
-      );
+    if (
+      !result ||
+      result.length === 0 ||
+      !result[0].reading_count ||
+      result[0].reading_count === '0'
+    ) {
+      throw new NotFoundException(`No data found for vehicle ${vehicleId} in the last 24 hours`);
     }
 
     const totalAc = parseFloat(result[0].total_ac) || 0;
@@ -79,8 +82,9 @@ export class AnalyticsCachedService {
     // Cache the result
     if (this.USE_CACHE) {
       const cacheKey = `performance:${vehicleId}`;
-      await this.cacheManager.set(cacheKey, response, 60000); // 60 seconds TTL
-      this.logger.debug(`✓ Cached result for ${vehicleId}`);
+      // Cache for 5 minutes (300 seconds) - matches default TTL from RedisModule
+      await this.cacheManager.set(cacheKey, response, 300 * 1000);
+      this.logger.debug(`✓ Cached result for ${vehicleId} (TTL: 5 minutes)`);
     }
 
     return response;

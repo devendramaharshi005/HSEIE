@@ -194,3 +194,5 @@ BEGIN
     RAISE NOTICE '🎯 Ready for 28.8M records/day ingestion';
 END $$;
 
+
+

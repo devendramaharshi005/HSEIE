@@ -4,7 +4,13 @@ services:
   redis:
     image: redis:7-alpine
     container_name: hseie-redis
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 300 10000
+      --save 60 50000
+      --save 10 100000
     ports:
       - "6379:6379"
     healthcheck:

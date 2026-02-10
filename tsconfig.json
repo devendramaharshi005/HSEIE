@@ -19,7 +19,7 @@
     "noFallthroughCasesInSwitch": false,
     "esModuleInterop": true
   },
-  "include": ["src/**/*", "simulator/**/*"],
+  "include": ["src/**/*", "simulator/**/*", "scripts/**/*"],
   "exclude": ["node_modules", "dist"]
 }
 

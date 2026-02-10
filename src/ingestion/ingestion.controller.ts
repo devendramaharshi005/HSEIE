@@ -76,12 +76,34 @@ export class IngestionController {
   @Get('queue/stats')
   @ApiOperation({
     summary: 'Get queue statistics',
-    description:
-      'Returns current status of Redis ingestion queues (waiting, active, completed, failed jobs)',
+    description: 'Returns the current status of meter and vehicle ingestion queues',
   })
   @ApiResponse({
     status: 200,
-    description: 'Queue statistics retrieved successfully',
+    description: 'Queue statistics',
+    schema: {
+      type: 'object',
+      properties: {
+        meterQueue: {
+          type: 'object',
+          properties: {
+            waiting: { type: 'number', description: 'Jobs waiting to be processed' },
+            active: { type: 'number', description: 'Jobs currently being processed' },
+            completed: { type: 'number', description: 'Successfully processed jobs' },
+            failed: { type: 'number', description: 'Failed jobs (after retries)' },
+          },
+        },
+        vehicleQueue: {
+          type: 'object',
+          properties: {
+            waiting: { type: 'number', description: 'Jobs waiting to be processed' },
+            active: { type: 'number', description: 'Jobs currently being processed' },
+            completed: { type: 'number', description: 'Successfully processed jobs' },
+            failed: { type: 'number', description: 'Failed jobs (after retries)' },
+          },
+        },
+      },
+    },
   })
   async getQueueStats() {
     return this.ingestionService.getQueueStats();

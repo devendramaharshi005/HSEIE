@@ -18,6 +18,14 @@ IoT Devices (10K meters + 10K vehicles)
          ↓
     NestJS API (Ingestion Layer)
     - Validation (DTOs)
+    - Queue/Direct mode selection
+         ↓
+    Redis Queue (BullMQ)
+    ├─ meter-ingestion queue
+    └─ vehicle-ingestion queue
+         ↓
+    Queue Processors (10 concurrent workers)
+    - Batch processing
     - Dual-write strategy
          ↓
     PostgreSQL Database
@@ -32,6 +40,7 @@ IoT Devices (10K meters + 10K vehicles)
     Analytics Engine
     - 24-hour performance summaries
     - Efficiency calculations (DC/AC ratio)
+    - Redis caching (optional)
 ```
 
 ## 🔑 Key Features
@@ -94,6 +103,189 @@ WHERE v.vehicle_id = $1
 - **DC Delivered** (from vehicle): Energy actually stored in battery
 - **Efficiency = (DC/AC) × 100%**: Typically 85-95% (conversion losses)
 - **Alert Threshold**: <85% indicates hardware fault or energy leakage
+
+### 4. **Redis Queue System (BullMQ)**
+
+The system uses **Redis + BullMQ** for asynchronous job processing to handle high-throughput ingestion.
+
+**Queue Architecture:**
+- **Two Separate Queues**: `meter-ingestion` and `vehicle-ingestion` (isolated processing)
+- **Queue Mode**: Enabled by default (`USE_QUEUE=true` in `.env`)
+- **Direct Mode**: Can be disabled for low-latency synchronous writes (`USE_QUEUE=false`)
+- **Redis Instance**: Shared Redis instance for both queues and caching (different databases)
+
+**How Redis Queue Works:**
+
+1. **Job Enqueue (API Layer)**:
+   - When telemetry arrives at `/v1/ingest/meter` or `/v1/ingest/vehicle`
+   - DTO is validated using `class-validator`
+   - Job is added to Redis queue via `queue.add()` with job data payload
+   - API returns immediately with `jobId` (async response)
+   - Job data includes: `meterId/vehicleId`, telemetry fields, and `timestamp`
+
+2. **Job Processing (Worker Layer)**:
+   - Queue processors (`MeterIngestionProcessor`, `VehicleIngestionProcessor`) listen to Redis
+   - Each processor runs with **concurrency: 10** (10 parallel jobs per queue)
+   - When a job is picked up, `process()` method executes dual-write:
+     - **Hot Table**: UPSERT using `INSERT ... ON CONFLICT UPDATE` (updates existing row)
+     - **Cold Table**: INSERT new row (append-only)
+   - Both writes happen in parallel using `Promise.all()`
+   - On success: Job marked as completed
+   - On failure: Job retried (up to 3 attempts with exponential backoff)
+
+3. **Redis Configuration**:
+   - **Connection**: `localhost:6379` (or `REDIS_HOST` from env)
+   - **Memory Limit**: 512MB with LRU eviction policy
+   - **Retry Policy**: 3 attempts with exponential backoff (1s, 2s, 4s delays)
+   - **Job Retention**:
+     - Completed jobs: Kept for 1 hour OR last 1000 jobs (whichever limit reached first)
+     - Failed jobs: Kept for 24 hours for debugging
+
+**Read/Write Update Frequency:**
+
+**Write Frequency (Ingestion):**
+- **API Endpoint**: Receives telemetry data (333 writes/second at scale)
+  - Each device sends data every 60 seconds
+  - At 10K devices: 10,000 devices × 2 endpoints (meter + vehicle) / 60s = 333 writes/second
+- **Queue Add**: Jobs are added to Redis queue immediately (<1ms latency)
+  - Job is enqueued via `queue.add()` in `IngestionService`
+  - API returns immediately with `jobId` (non-blocking)
+  - Redis stores job in memory (512MB limit with LRU eviction)
+- **Queue Processing**: Processors consume jobs at **10 concurrent jobs per queue**
+  - Each queue (`meter-ingestion`, `vehicle-ingestion`) has its own processor
+  - Concurrency: 10 means 10 jobs processed in parallel per queue
+  - Total processing capacity: 20 jobs/second (10 per queue × 2 queues)
+- **Database Write**: Each job performs dual-write (UPSERT to hot table + INSERT to cold table)
+  - Both writes executed in parallel using `Promise.all()` for performance
+  - Hot table: `INSERT ... ON CONFLICT UPDATE` (atomic UPSERT)
+  - Cold table: `INSERT` (append-only, never updates)
+  - Write latency: ~5-10ms per job (both tables)
+- **Effective Throughput**: Up to 20 database writes/second per queue (40 total with 2 queues)
+  - With 10 concurrent workers per queue: 10 jobs × 2 writes (hot + cold) = 20 writes/sec per queue
+  - Two queues: 40 total database writes/second
+- **Queue Backlog**: If ingestion rate exceeds processing rate, jobs accumulate in Redis
+  - Monitor via `GET /v1/ingest/queue/stats` endpoint
+  - If `waiting` count grows, consider increasing concurrency or adding more workers
+  - Redis memory usage increases with backlog (monitor via Redis CLI: `redis-cli INFO memory`)
+
+**Read Frequency (Analytics):**
+- **Current State Queries**: Read from hot tables (`meter_current`, `vehicle_current`)
+  - Query frequency: On-demand (dashboard requests)
+  - Query time: <10ms (primary key lookup via `meter_id` or `vehicle_id`)
+  - Endpoint: `GET /v1/ingest/vehicle/:vehicleId/current`
+  - Query pattern: `SELECT * FROM vehicle_current WHERE vehicle_id = $1`
+  - No joins required, single table lookup
+- **Historical Queries**: Read from cold tables (`meter_history`, `vehicle_history`)
+  - Query frequency: On-demand (analytics requests)
+  - Query time: <500ms (with partition pruning and composite indexes)
+  - Endpoint: `GET /v1/analytics/performance/:vehicleId`
+  - Query pattern: JOIN between `vehicle_history` and `meter_history` with time-window correlation
+  - Partition pruning: Only scans relevant day partitions (e.g., last 24 hours = 2 partitions)
+  - Composite index: `(vehicle_id, timestamp DESC)` enables index-only scans
+- **Cache (Optional)**: Redis cache for analytics results (separate from queue Redis)
+  - Cache TTL: 5 minutes (300 seconds)
+  - Cache key format: `performance:{vehicleId}`
+  - Cache enabled by default (`USE_CACHE=true` in `.env`)
+  - Note: Currently implemented but not used (analytics module uses `AnalyticsService`, not `AnalyticsCachedService`)
+
+**How Tables Show Updated Data:**
+
+**Hot Tables (Current State):**
+- **Update Mechanism**: UPSERT operation (`INSERT ... ON CONFLICT UPDATE`)
+  - Implemented via TypeORM `createQueryBuilder().insert().orUpdate()`
+  - SQL: `INSERT INTO vehicle_current (...) VALUES (...) ON CONFLICT (vehicle_id) DO UPDATE SET ...`
+  - Conflict resolution: Uses primary key (`vehicle_id` or `meter_id`) to detect existing row
+  - Atomic operation: Either inserts new row or updates existing row (no race conditions)
+- **Update Frequency**: Every time a new telemetry reading arrives (every 60 seconds per device)
+  - In queue mode: Updated when queue processor processes the job
+  - In direct mode: Updated immediately when API receives request
+- **Update Fields**: All telemetry fields + `updated_at` timestamp (auto-updated)
+  - Vehicle: `soc`, `kwh_delivered_dc`, `battery_temp`, `timestamp`, `updated_at`
+  - Meter: `kwh_consumed_ac`, `voltage`, `timestamp`, `updated_at`
+- **Visibility**: Changes are immediately visible after UPSERT completes (within milliseconds)
+  - PostgreSQL transaction isolation ensures consistency
+  - No caching layer, direct database reads
+- **Example**: When `VEHICLE_001` sends new data at 12:00:00:
+  - If row exists: Updates existing row with new SoC, temperature, etc. (previous values overwritten)
+  - If row doesn't exist: Inserts new row
+  - Result: Table always has exactly one row per device (current state)
+- **Query**: `SELECT * FROM vehicle_current WHERE vehicle_id = 'VEHICLE_001'` returns latest state
+  - Always returns single row (or NULL if device never sent data)
+  - Fast lookup via primary key index
+
+**Cold Tables (History):**
+- **Update Mechanism**: INSERT only (append-only, never updates or deletes)
+  - Implemented via TypeORM `repository.insert()` or `createQueryBuilder().insert()`
+  - SQL: `INSERT INTO vehicle_history (...) VALUES (...)`
+  - No conflict resolution: Always creates new row (even if timestamp is duplicate)
+  - Partition-aware: PostgreSQL automatically routes INSERT to correct partition based on `timestamp`
+- **Update Frequency**: Every time a new telemetry reading arrives (every 60 seconds per device)
+  - In queue mode: Inserted when queue processor processes the job
+  - In direct mode: Inserted immediately when API receives request
+- **Update Fields**: New row inserted with all telemetry data + `created_at` timestamp (auto-generated)
+  - Vehicle: `id` (auto-increment), `vehicle_id`, `soc`, `kwh_delivered_dc`, `battery_temp`, `timestamp`, `created_at`
+  - Meter: `id` (auto-increment), `meter_id`, `kwh_consumed_ac`, `voltage`, `timestamp`, `created_at`
+- **Visibility**: New rows are immediately visible after INSERT completes (within milliseconds)
+  - PostgreSQL transaction isolation ensures consistency
+  - Partition pruning ensures queries only scan relevant partitions
+- **Example**: When `VEHICLE_001` sends new data at 12:00:00:
+  - New row inserted with `id=12345`, `vehicle_id='VEHICLE_001'`, `timestamp='2026-02-09 12:00:00'`
+  - Previous rows remain unchanged (11:59:00, 11:58:00, etc.)
+  - Table grows continuously (28.8M rows/day at scale)
+- **Query**: `SELECT * FROM vehicle_history WHERE vehicle_id = 'VEHICLE_001' ORDER BY timestamp DESC` returns all historical readings
+  - Returns multiple rows (one per telemetry reading)
+  - Uses composite index `(vehicle_id, timestamp DESC)` for fast retrieval
+  - Partition pruning: Only scans partitions containing data for the time range
+
+**How to Update History (Important):**
+- **History tables are append-only**: They never update or delete existing rows
+- **To "update" history**: Simply insert a new row with the corrected data
+  - Example: If you need to correct a reading at 12:00:00, insert a new row with corrected values
+  - The original row remains (audit trail preserved)
+  - Analytics queries can filter by timestamp or use the latest row per timestamp
+- **Data correction strategy**: 
+  - Option 1: Insert correction row with same timestamp (analytics can use `MAX(id)` to get latest)
+  - Option 2: Insert correction row with new timestamp (analytics filters by time range)
+  - Option 3: Use a separate `corrections` table and join in analytics queries
+
+**Queue Processing Flow:**
+```
+1. API receives telemetry → Validates DTO (class-validator)
+2. Job added to Redis queue → Returns immediately (async, <1ms)
+3. Queue processor picks up job → Processes in background (10 concurrent)
+4. Dual-write executed (in parallel):
+   - UPSERT to hot table (meter_current/vehicle_current) → Updates existing row
+   - INSERT to cold table (meter_history/vehicle_history) → Adds new row
+5. Job marked as completed → Removed after retention period (1 hour or 1000 jobs)
+```
+
+**Monitoring Queue Status:**
+```bash
+# Get queue statistics
+curl http://localhost:3000/v1/ingest/queue/stats
+
+# Response:
+{
+  "meterQueue": {
+    "waiting": 5,      // Jobs waiting to be processed
+    "active": 10,      // Jobs currently being processed
+    "completed": 1234, // Successfully processed jobs
+    "failed": 2        // Failed jobs (after retries)
+  },
+  "vehicleQueue": {
+    "waiting": 3,
+    "active": 8,
+    "completed": 1567,
+    "failed": 1
+  }
+}
+```
+
+**Direct Mode (Queue Disabled):**
+- Set `USE_QUEUE=false` in `.env`
+- API writes directly to database (synchronous)
+- Lower latency but reduced throughput
+- Suitable for low-volume scenarios (<100 devices)
 
 ## 🚀 Quick Start
 

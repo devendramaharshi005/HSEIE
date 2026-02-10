@@ -1,7 +1,9 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Logger } from '@nestjs/common';
+import { Logger, Inject } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Cache } from 'cache-manager';
 import { Repository } from 'typeorm';
 import { MeterCurrent } from '../../ingestion/entities/meter-current.entity';
 import { MeterHistory } from '../../ingestion/entities/meter-history.entity';
@@ -18,12 +20,15 @@ interface MeterJobData {
 })
 export class MeterIngestionProcessor extends WorkerHost {
   private readonly logger = new Logger(MeterIngestionProcessor.name);
+  private readonly USE_CACHE = process.env.USE_CACHE !== 'false'; // Default: true
 
   constructor(
     @InjectRepository(MeterCurrent)
     private meterCurrentRepo: Repository<MeterCurrent>,
     @InjectRepository(MeterHistory)
     private meterHistoryRepo: Repository<MeterHistory>,
+    @Inject(CACHE_MANAGER)
+    private cacheManager: Cache,
   ) {
     super();
   }
@@ -61,6 +66,14 @@ export class MeterIngestionProcessor extends WorkerHost {
           })
           .execute(),
       ]);
+
+      // Invalidate cache for this meter after successful write
+      if (this.USE_CACHE) {
+        const cacheKey = `meter:current:${meterId}`;
+        await this.cacheManager.del(cacheKey).catch((err) => {
+          this.logger.warn(`Failed to invalidate cache for ${meterId}: ${err.message}`);
+        });
+      }
 
       return { success: true, meterId, timestamp };
     } catch (error) {
